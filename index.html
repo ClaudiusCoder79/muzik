@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Muzik">
+<meta name="theme-color" content="#111113">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+<title>Muzik</title>
+</head>
+<body>
+<main id="view"></main>
+<div id="mini" hidden></div>
+<nav id="tabs">
+  <button data-act="tab" data-tab="music" class="tab"></button>
+  <button data-act="tab" data-tab="books" class="tab"></button>
+  <button data-act="tab" data-tab="add" class="tab"></button>
+</nav>
+<section id="player" class="sheet" hidden></section>
+<section id="editor" class="sheet" hidden></section>
+<div id="toast" hidden></div>
+<input type="file" id="pickMusic" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg" multiple hidden>
+<input type="file" id="pickBook" accept="audio/*,.mp3,.m4a,.m4b,.aac" multiple hidden>
+<input type="file" id="pickCover" accept="image/*" hidden>
+<audio id="audio" preload="auto"></audio>
+<script src="vendor/jsmediatags.min.js"></script>
+<script src="vendor/browser-id3-writer.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
