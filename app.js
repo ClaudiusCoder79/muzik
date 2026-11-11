@@ -62,6 +62,9 @@ const P = {
   list: '<path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
   trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>',
+  minus: '<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>',
+  listPlus: '<path d="M3 6h12M3 12h12M3 18h8"/><path d="M18 15v6M15 18h6"/>',
+  check: '<path d="M5 12l5 5L20 7"/>',
   share: '<path d="M12 3v13"/><path d="M7 8l5-5 5 5"/><path d="M5 14v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/>',
   back15: '<path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3 3.5v4h4"/><text x="12" y="15.2" text-anchor="middle" font-size="7" font-weight="700" fill="currentColor" stroke="none">15</text>',
   fwd30: '<path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M21 3.5v4h-4"/><text x="12" y="15.2" text-anchor="middle" font-size="7" font-weight="700" fill="currentColor" stroke="none">30</text>'
@@ -73,12 +76,12 @@ const I = (name, size = 24, sw = 2) => sv(P[name], size, FILLED.has(name), sw);
 let db;
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open('muzik', 1);
+    const r = indexedDB.open('muzik', 2);
     r.onupgradeneeded = () => {
       const d = r.result;
-      d.createObjectStore('songs', { keyPath: 'id' });
-      d.createObjectStore('books', { keyPath: 'id' });
-      d.createObjectStore('progress', { keyPath: 'id' });
+      for (const n of ['songs', 'books', 'progress', 'playlists']) {
+        if (!d.objectStoreNames.contains(n)) d.createObjectStore(n, { keyPath: 'id' });
+      }
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -89,12 +92,16 @@ const os = (name, mode = 'readonly') => db.transaction(name, mode).objectStore(n
 const dbAll = (n) => req2p(os(n).getAll());
 const dbPut = (n, o) => req2p(os(n, 'readwrite').put(clean(o)));
 const dbDel = (n, id) => req2p(os(n, 'readwrite').delete(id));
-function clean(o) { const { _cu, ...rest } = o; return rest; } // never store temporary picture links
+function clean(o) { // never store temporary values (keys starting with _)
+  const out = {};
+  for (const k of Object.keys(o)) if (k[0] !== '_') out[k] = o[k];
+  return out;
+}
 
 /* ============================== state ============================== */
 const S = {
-  songs: [], books: [], progress: {},
-  tab: 'music', musicView: 'songs', search: '', group: null, // group = {type:'album'|'artist', name}
+  songs: [], books: [], progress: {}, playlists: [],
+  tab: 'music', musicView: 'songs', search: '', group: null, // group = {type:'album'|'artist'|'playlist', name}
   visible: [],             // song ids shown in the current list (for "tap to play")
   mode: null,              // 'song' | 'book' | null
   queue: [], orig: [], qi: 0, shuffle: false, repeat: 'off',
@@ -103,7 +110,7 @@ const S = {
   sleep: 0, sleepEnd: 0, sleepAtEnd: false,
   jobs: []
 };
-const SLEEP = [{ label: 'Sleep timer' }, { label: '15 min', m: 15 }, { label: '30 min', m: 30 }, { label: '60 min', m: 60 }, { label: 'End of part', end: true }];
+const SLEEP = [{ label: 'Sleep timer' }, { label: '15 min', m: 15 }, { label: '30 min', m: 30 }, { label: '60 min', m: 60 }, { label: 'End of chapter', end: true }];
 const SPEEDS = [0.75, 1, 1.25, 1.5, 2, 3];
 const song = (id) => S.songs.find((s) => s.id === id);
 const book = (id) => S.books.find((b) => b.id === id);
@@ -118,6 +125,154 @@ function bookDone(b) {
   const p = prog(b.id);
   if (p.finished) return bookTotal(b);
   return sum(b.parts.slice(0, p.part).map((x) => x.duration || 0)) + (p.pos || 0);
+}
+
+/* ---------- chapters ("table of contents") of a book ----------
+   Each entry is one chapter (from M4B chapter marks) or one whole part (MP3 parts). */
+function toc(b) {
+  if (b._toc) return b._toc;
+  const list = [];
+  b.parts.forEach((p, pi) => {
+    const dur = p.duration || 0;
+    const ch = (p.chapters || []).filter((c) => !dur || c.start < dur - 0.5);
+    if (ch.length > 1) {
+      ch.forEach((c, ci) => list.push({ part: pi, start: c.start, end: ci < ch.length - 1 ? ch[ci + 1].start : dur, title: c.title || `Chapter ${ci + 1}`, ch: true }));
+    } else {
+      list.push({ part: pi, start: 0, end: dur, title: baseName(p.name), ch: false });
+    }
+  });
+  b._toc = list;
+  return list;
+}
+const hasChapters = (b) => toc(b).some((e) => e.ch);
+function bookTime(b) { // position inside the current part
+  return S.mode === 'book' && S.bookId === b.id && audio.src && !pendingSeek ? audio.currentTime : prog(b.id).pos || 0;
+}
+function entryIndex(b) {
+  const p = prog(b.id), t = bookTime(b), list = toc(b);
+  let idx = 0;
+  list.forEach((e, i) => { if (e.part < p.part || (e.part === p.part && e.start <= t + 0.05)) idx = i; });
+  return idx;
+}
+function tocLabel(b) {
+  const list = toc(b);
+  if (list.length < 2) return '';
+  return `${hasChapters(b) ? 'Chapter' : 'Part'} ${entryIndex(b) + 1} of ${list.length}`;
+}
+
+/* Read chapter marks from an M4B / M4A file (Nero "chpl" list or QuickTime chapter track). */
+async function readChapters(blob) {
+  try {
+    const head = async (pos) => new DataView(await blob.slice(pos, pos + 16).arrayBuffer());
+    let pos = 0, moov = null;
+    while (pos + 8 <= blob.size) {
+      const h = await head(pos);
+      let size = h.getUint32(0);
+      const type = String.fromCharCode(h.getUint8(4), h.getUint8(5), h.getUint8(6), h.getUint8(7));
+      if (size === 1) size = Number(h.getBigUint64(8));
+      else if (size === 0) size = blob.size - pos;
+      if (size < 8) break;
+      if (type === 'moov') { moov = { pos, size }; break; }
+      pos += size;
+    }
+    if (!moov || moov.size > 80e6) return [];
+    const dv = new DataView(await blob.slice(moov.pos, moov.pos + moov.size).arrayBuffer());
+    const str = (p, n) => { let s = ''; for (let i = 0; i < n; i++) s += String.fromCharCode(dv.getUint8(p + i)); return s; };
+    const kids = (body, end) => {
+      const out = [];
+      let p = body;
+      while (p + 8 <= end) {
+        let size = dv.getUint32(p), hdr = 8;
+        const type = str(p + 4, 4);
+        if (size === 1) { size = Number(dv.getBigUint64(p + 8)); hdr = 16; } else if (size === 0) size = end - p;
+        if (size < 8 || p + size > end) break;
+        out.push({ type, body: p + hdr, end: p + size });
+        p += size;
+      }
+      return out;
+    };
+    const child = (a, type) => (a ? kids(a.body, a.end).find((x) => x.type === type) : null);
+    const path = (a, ...types) => { for (const t of types) a = child(a, t); return a; };
+    const root = { body: 8, end: dv.byteLength };
+    const decode = (bytes) => {
+      if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes.slice(2));
+      return new TextDecoder('utf-8').decode(bytes);
+    };
+    const clean = (list) => list.filter((c) => isFinite(c.start)).sort((x, y) => x.start - y.start);
+
+    // 1) QuickTime chapter track (Apple Books / iTunes style)
+    const traks = kids(root.body, root.end).filter((x) => x.type === 'trak');
+    const trackId = (t) => { const k = child(t, 'tkhd'); return k ? dv.getUint32(k.body + (dv.getUint8(k.body) === 1 ? 20 : 12)) : -1; };
+    let chapId = null;
+    for (const t of traks) {
+      const c = path(t, 'tref', 'chap');
+      if (c && c.end - c.body >= 4) { chapId = dv.getUint32(c.body); break; }
+    }
+    const ct = chapId != null ? traks.find((t) => trackId(t) === chapId) : null;
+    if (ct) {
+      const mdhd = path(ct, 'mdia', 'mdhd');
+      const stbl = path(ct, 'mdia', 'minf', 'stbl');
+      if (mdhd && stbl) {
+        const scale = dv.getUint32(mdhd.body + (dv.getUint8(mdhd.body) === 1 ? 20 : 12)) || 1;
+        const stts = child(stbl, 'stts'), stsz = child(stbl, 'stsz'), stsc = child(stbl, 'stsc');
+        const stco = child(stbl, 'stco'), co64 = child(stbl, 'co64');
+        if (stts && stsz && stsc && (stco || co64)) {
+          const starts = [];
+          let t = 0;
+          for (let i = 0, n = dv.getUint32(stts.body + 4); i < n; i++) {
+            const cnt = dv.getUint32(stts.body + 8 + i * 8), delta = dv.getUint32(stts.body + 12 + i * 8);
+            for (let j = 0; j < cnt; j++) { starts.push(t / scale); t += delta; }
+          }
+          const fixed = dv.getUint32(stsz.body + 4), nS = dv.getUint32(stsz.body + 8);
+          const sizes = []; for (let i = 0; i < nS; i++) sizes.push(fixed || dv.getUint32(stsz.body + 12 + i * 4));
+          const co = stco || co64, nC = dv.getUint32(co.body + 4);
+          const chunkOff = []; for (let i = 0; i < nC; i++) chunkOff.push(stco ? dv.getUint32(co.body + 8 + i * 4) : Number(dv.getBigUint64(co.body + 8 + i * 8)));
+          const sc = []; for (let i = 0, n = dv.getUint32(stsc.body + 4); i < n; i++) sc.push({ first: dv.getUint32(stsc.body + 8 + i * 12), per: dv.getUint32(stsc.body + 12 + i * 12) });
+          const offs = [];
+          let s = 0;
+          for (let c = 1; c <= nC && s < nS; c++) {
+            let per = 1; for (const e of sc) if (e.first <= c) per = e.per;
+            let off = chunkOff[c - 1];
+            for (let k = 0; k < per && s < nS; k++, s++) { offs.push(off); off += sizes[s]; }
+          }
+          const list = [];
+          for (let i = 0; i < offs.length && i < starts.length; i++) {
+            const bytes = new Uint8Array(await blob.slice(offs[i], offs[i] + Math.min(sizes[i], 1024)).arrayBuffer());
+            if (bytes.length < 2) continue;
+            const len = Math.min((bytes[0] << 8) | bytes[1], bytes.length - 2);
+            list.push({ start: starts[i], title: decode(bytes.slice(2, 2 + len)).trim() });
+          }
+          if (list.length > 1) return clean(list);
+        }
+      }
+    }
+    // 2) Nero "chpl" chapter list
+    const chpl = path(root, 'udta', 'chpl');
+    if (chpl) {
+      let p = chpl.body;
+      const version = dv.getUint8(p); p += 4;
+      if (version) p += 4;
+      const n = dv.getUint8(p); p += 1;
+      const list = [];
+      for (let i = 0; i < n && p + 9 <= chpl.end; i++) {
+        const start = Number(dv.getBigUint64(p)) / 1e7; p += 8;
+        const len = dv.getUint8(p); p += 1;
+        list.push({ start, title: decode(new Uint8Array(dv.buffer, dv.byteOffset + p, Math.min(len, chpl.end - p))).trim() });
+        p += len;
+      }
+      if (list.length > 1) return clean(list);
+    }
+  } catch (e) { console.warn('chapters', e); }
+  return [];
+}
+const mayHaveChapters = (f) => /\.(m4b|m4a|mp4|aac)$/i.test(f.name || '') || /mp4|m4a|m4b/.test(f.type || '');
+// Books added before chapters were supported: read their chapters once.
+async function ensureChapters(b) {
+  if (b.parts.every((p) => Array.isArray(p.chapters))) return;
+  for (const p of b.parts) if (!Array.isArray(p.chapters)) p.chapters = mayHaveChapters(p.blob.name ? p.blob : { name: p.name, type: p.blob.type }) ? await readChapters(p.blob) : [];
+  b._toc = null;
+  dbPut('books', b).catch(() => {});
+  if (S.bookId === b.id) { updateMedia(); renderAll(); }
 }
 
 /* ============================== pictures ============================== */
@@ -229,7 +384,7 @@ async function importBook(files) {
         if (i === 0) tags = t;
         if (!cover) cover = picToBlob(t.picture);
       }
-      parts.push({ blob: f, name: f.name, duration: await getDuration(f) });
+      parts.push({ blob: f, name: f.name, duration: await getDuration(f), chapters: mayHaveChapters(f) ? await readChapters(f) : [] });
       job.pct = Math.round(((i + 1) / files.length) * 90); renderView();
     }
     const multi = files.length > 1;
@@ -321,6 +476,31 @@ function playBook(id) {
   if (p.finished) { p.finished = false; p.part = 0; p.pos = 0; }
   setHandlers();
   loadPart(p.part, p.pos, true);
+  ensureChapters(b);
+}
+function jumpEntry(i) {
+  const b = curBook();
+  if (!b) return;
+  const list = toc(b);
+  i = Math.max(0, Math.min(list.length - 1, i));
+  const e = list[i], p = prog(b.id);
+  if (e.part !== p.part) loadPart(e.part, e.start, true);
+  else { audio.currentTime = e.start; if (audio.paused) play(); }
+  S.showParts = false;
+  renderPlayer();
+}
+function prevEntry() {
+  const b = curBook();
+  if (!b) return;
+  const i = entryIndex(b), e = toc(b)[i];
+  if (audio.currentTime - e.start > 3 || i === 0) audio.currentTime = e.start;
+  else jumpEntry(i - 1);
+}
+function nextEntry() {
+  const b = curBook();
+  if (!b) return;
+  const i = entryIndex(b);
+  if (i < toc(b).length - 1) jumpEntry(i + 1);
 }
 function loadPart(i, pos, autoplay) {
   const b = curBook();
@@ -371,7 +551,9 @@ function cycleSleep() {
   const o = SLEEP[S.sleep];
   S.sleepEnd = o.m ? Date.now() + o.m * 60000 : 0;
   S.sleepAtEnd = !!o.end;
-  if (S.sleep) toast(o.end ? 'Will stop at the end of this part' : `Will stop in ${o.m} minutes`);
+  const b = curBook();
+  S.sleepEntry = b ? entryIndex(b) : -1;
+  if (S.sleep) toast(o.end ? (b ? 'Will stop at the end of this chapter' : 'Will stop at the end of this song') : `Will stop in ${o.m} minutes`);
   renderPlayer();
 }
 function sleepNow() {
@@ -389,7 +571,15 @@ audio.addEventListener('play', () => { audio.playbackRate = rate(); renderMini()
 audio.addEventListener('pause', () => { saveBookPos(true); renderMini(); renderPlayerButtons(); });
 audio.addEventListener('timeupdate', () => {
   if (S.sleepEnd && Date.now() >= S.sleepEnd) { sleepNow(); toast('Sleep timer: stopped'); }
-  if (S.mode === 'book') saveBookPos(false);
+  if (S.mode === 'book') {
+    saveBookPos(false);
+    const b = curBook();
+    if (b && !pendingSeek) {
+      const i = entryIndex(b);
+      if (S.sleepAtEnd && S.sleepEntry >= 0 && i !== S.sleepEntry) { sleepNow(); toast('Sleep timer: stopped at the end of the chapter'); }
+      if (i !== S.lastEntry) { S.lastEntry = i; updateMedia(); if (S.playerOpen) renderPlayer(); }
+    }
+  }
   if (Math.abs(audio.currentTime - lastPos) >= 0.5) { lastPos = audio.currentTime; updateTimes(); }
 });
 audio.addEventListener('ended', () => {
@@ -436,7 +626,8 @@ function updateMedia() {
   if (!it) return;
   const u = coverUrl(it);
   const artwork = u ? [{ src: u, sizes: '512x512', type: it.cover.type || 'image/jpeg' }] : [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }];
-  const album = s ? s.album : b.parts.length > 1 ? `Part ${prog(b.id).part + 1} of ${b.parts.length}` : '';
+  const list = b ? toc(b) : [];
+  const album = s ? s.album : list.length > 1 ? list[entryIndex(b)].title : '';
   navigator.mediaSession.metadata = new MediaMetadata({ title: it.title, artist: s ? s.artist : b.author, album, artwork });
 }
 
@@ -465,7 +656,7 @@ function renderView() {
 function songMatches(s, q) {
   return !q || [s.title, s.artist, s.album, s.genre].some((x) => String(x || '').toLowerCase().includes(q));
 }
-function songRows(list) {
+function songRows(list, removable) {
   S.visible = list.map((s) => s.id);
   const playingId = S.mode === 'song' ? S.queue[S.qi] : null;
   return list.map((s, i) => `
@@ -477,7 +668,9 @@ function songRows(list) {
           <span class="t2">${esc([s.artist || 'Unknown artist', fmt(s.duration)].join(' · '))}</span>
         </span>
       </button>
-      <button class="icon-btn" data-act="edit" data-kind="song" data-id="${s.id}" aria-label="Edit tags of ${esc(s.title)}">${I('edit', 20)}</button>
+      ${removable
+        ? `<button class="icon-btn" data-act="pl-remove" data-i="${i}" aria-label="Remove ${esc(s.title)} from playlist">${I('minus', 22)}</button>`
+        : `<button class="icon-btn" data-act="edit" data-kind="song" data-id="${s.id}" aria-label="Edit tags of ${esc(s.title)}">${I('edit', 20)}</button>`}
     </div>`).join('');
 }
 function groupsOf(key) {
@@ -494,6 +687,17 @@ function sortAlbum(list) {
 }
 function musicList() {
   const q = S.search.trim().toLowerCase();
+  if (S.group && S.group.type === 'playlist') {
+    const pl = playlist(S.group.name);
+    if (!pl) { S.group = null; return musicList(); }
+    const list = pl.songIds.map(song).filter((s) => s && songMatches(s, q));
+    return `<div class="backrow"><button data-act="ungroup">${I('back', 22)}Playlists</button></div>
+      <div class="head" style="padding-top:0"><h2 style="margin:0;font-size:22px">${esc(pl.name)}</h2>
+        <span style="display:flex;gap:8px"><button class="round" data-act="pl-rename" aria-label="Rename playlist">${I('edit', 20)}</button>
+        <button class="round" data-act="pl-delete" aria-label="Delete playlist" style="color:var(--danger)">${I('trash', 20)}</button></span></div>
+      <div class="actions" style="padding-bottom:12px"><button class="big" data-act="pl-choose">${I('plus', 18, 2.4)}Add or remove songs</button></div>
+      ${list.length ? actions() + songRows(list, !q) : `<div class="empty">This playlist is empty.<br>Tap “Add or remove songs”, or use “Add to playlist” in the player.</div>`}`;
+  }
   if (S.group) {
     const key = S.group.type;
     const list = S.songs.filter((s) => (s[key] || (key === 'album' ? 'Unknown album' : 'Unknown artist')) === S.group.name && songMatches(s, q));
@@ -501,6 +705,20 @@ function musicList() {
     return `<div class="backrow"><button data-act="ungroup">${I('back', 22)}Back</button></div>
       <div class="head" style="padding-top:0"><h2 style="margin:0;font-size:22px">${esc(S.group.name)}</h2></div>
       ${actions()}${songRows(sorted)}`;
+  }
+  if (S.musicView === 'playlists') {
+    S.visible = [];
+    const rows = S.playlists.slice().sort((x, y) => byText(x.name, y.name)).filter((pl) => !q || pl.name.toLowerCase().includes(q)).map((pl) => {
+      const songs = pl.songIds.map(song).filter(Boolean);
+      const withArt = songs.find((s) => s.cover) || { id: pl.id };
+      const total = sum(songs.map((s) => s.duration || 0));
+      return `<div class="row"><button class="hit" data-act="group" data-type="playlist" data-name="${enc(pl.id)}">
+        ${art(withArt, 48, 'song')}
+        <span class="txt"><span class="t1">${esc(pl.name)}</span><span class="t2">${songs.length} song${songs.length === 1 ? '' : 's'}${total ? ' · ' + fmtLeft(total) : ''}</span></span>
+      </button></div>`;
+    }).join('');
+    return `<div class="actions" style="padding-bottom:12px"><button class="big" data-act="pl-new">${I('plus', 18, 2.4)}New playlist</button></div>
+      ${rows || '<div class="empty">No playlists yet.</div>'}`;
   }
   if (S.musicView === 'songs') {
     const list = S.songs.filter((s) => songMatches(s, q)).sort((a, b) => byText(a.title, b.title));
@@ -539,7 +757,7 @@ function musicView() {
     return head + `<div class="empty">${I('note', 40, 1.6)}No music yet.<br>Add songs from the Files app (iCloud Drive, OneDrive, Downloads…).<br>
       <button class="primary" data-act="add-music">${I('plus', 20, 2.4)}Add music</button></div>`;
   }
-  const views = [['songs', 'Songs'], ['albums', 'Albums'], ['artists', 'Artists']];
+  const views = [['songs', 'Songs'], ['playlists', 'Playlists'], ['albums', 'Albums'], ['artists', 'Artists']];
   return head + `
     <label class="search">${I('search', 18)}<input id="q" type="search" placeholder="Search songs, artists, albums" value="${esc(S.search)}" autocomplete="off"></label>
     ${S.group ? '' : `<div class="chips">${views.map(([k, l]) => `<button class="chip${S.musicView === k ? ' on' : ''}" data-act="mview" data-v="${k}">${l}</button>`).join('')}</div>`}
@@ -573,7 +791,7 @@ function booksView() {
         ${art(cont, 96, 'book')}
         <span class="info">
           <span><span class="t1" style="display:block;font-weight:600;font-size:17px;white-space:normal">${esc(cont.title)}</span>
-          <span class="t2" style="display:block;margin-top:3px">${esc([cont.author, cont.parts.length > 1 ? `Part ${p.part + 1} of ${cont.parts.length}` : ''].filter(Boolean).join(' · '))}</span></span>
+          <span class="t2" style="display:block;margin-top:3px">${esc([cont.author, tocLabel(cont)].filter(Boolean).join(' · '))}</span></span>
           <span><span class="bar" style="display:block"><div style="width:${bookPct(cont)}%"></div></span>
           <span class="foot"><span class="t2">${esc(bookSub(cont))}</span><span class="pill">${I(playing ? 'pause' : 'play', 14)}${playing ? 'Playing' : 'Resume'}</span></span></span>
         </span>
@@ -659,10 +877,14 @@ function renderPlayer() {
   const s = curSong(), b = curBook();
   if (!s && !b) { S.playerOpen = false; el.hidden = true; return; }
   el.hidden = false;
+  const list = b ? toc(b) : [];
+  const ei = b ? entryIndex(b) : 0;
   const top = `<div class="topbar">
       <button class="icon-btn" data-act="close-player" aria-label="Close player">${I('down', 28, 2.2)}</button>
-      <div class="ttl">${s ? `<small>Playing</small>${esc(S.group ? S.group.name : 'Your music')}` : 'Audiobook'}</div>
-      ${b && b.parts.length > 1 ? `<button class="icon-btn" data-act="parts" aria-label="Parts">${I('list', 22)}</button>` : `<button class="icon-btn" data-act="edit" data-kind="${s ? 'song' : 'book'}" data-id="${(s || b).id}" aria-label="Edit tags">${I('edit', 22)}</button>`}
+      <div class="ttl">${s ? `<small>Playing</small>${esc(groupTitle())}` : 'Audiobook'}</div>
+      ${list.length > 1 ? `<button class="icon-btn" data-act="parts" aria-label="${hasChapters(b) ? 'Chapters' : 'Parts'}">${I('list', 22)}</button>`
+        : s ? `<button class="icon-btn" data-act="add-to-pl" data-id="${s.id}" aria-label="Add to playlist">${I('listPlus', 22)}</button>`
+        : `<button class="icon-btn" data-act="edit" data-kind="book" data-id="${b.id}" aria-label="Edit details">${I('edit', 22)}</button>`}
     </div>`;
   const seek = `<div class="seek"><input id="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position">
       <div class="times"><span id="tCur">0:00</span><span id="tLeft">-0:00</span></div>${b ? '<div class="left" id="tBook"></div>' : ''}</div>`;
@@ -678,21 +900,24 @@ function renderPlayer() {
         <button class="ctl" data-act="next" aria-label="Next">${I('next', 34)}</button>
         <button class="ctl sm${S.repeat !== 'off' ? ' on' : ''}" data-act="repeat" aria-label="Repeat: ${S.repeat}" style="position:relative">${I('repeat', 22)}${S.repeat === 'one' ? '<b style="position:absolute;font-size:9px;top:8px;right:6px">1</b>' : ''}</button>
       </div>
-      <div class="duo"><button class="${S.sleep ? 'on' : ''}" data-act="sleep">${I('moon', 18)}${esc(SLEEP[S.sleep].label.replace('part', 'song'))}</button>
-        <button data-act="edit" data-kind="song" data-id="${s.id}">${I('edit', 18)}Edit tags</button></div>
+      <div class="duo"><button class="${S.sleep ? 'on' : ''}" data-act="sleep">${I('moon', 18)}${esc(SLEEP[S.sleep].label.replace('chapter', 'song'))}</button>
+        <button data-act="add-to-pl" data-id="${s.id}">${I('listPlus', 18)}Add to playlist</button></div>
+      <div class="duo" style="grid-template-columns:1fr"><button data-act="edit" data-kind="song" data-id="${s.id}">${I('edit', 18)}Edit tags</button></div>
     </div>`;
   } else {
-    const p = prog(b.id);
+    const p = prog(b.id), e = list[ei];
     el.innerHTML = `<div class="inner">${top}
       ${art(b, 0, 'book', 'cover bookc')}
-      <div class="np-title center"><div class="center"><div class="t">${esc(b.title)}</div><div class="a">${esc(b.author || 'Unknown author')}</div>
-        ${b.parts.length > 1 ? `<button class="partbtn" data-act="parts">Part ${p.part + 1} of ${b.parts.length}${I('down', 14, 2.4)}</button>` : ''}</div></div>
-      ${S.showParts ? `<div class="parts">${b.parts.map((x, i) => `<button class="${i === p.part ? 'on' : ''}" data-act="part" data-i="${i}"><span>${esc(baseName(x.name))}</span><span class="t2">${fmt(x.duration)}</span></button>`).join('')}</div>` : ''}
+      <div class="np-title center"><div class="center" style="min-width:0"><div class="t">${esc(b.title)}</div><div class="a">${esc(b.author || 'Unknown author')}</div>
+        ${list.length > 1 ? `<button class="partbtn" data-act="parts"><span style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(tocLabel(b))}${e.ch ? ' · ' + esc(e.title) : ''}</span>${I('down', 14, 2.4)}</button>` : ''}</div></div>
+      ${S.showParts ? `<div class="parts">${list.map((x, i) => `<button class="${i === ei ? 'on' : ''}" data-act="part" data-i="${i}"><span>${esc(x.title)}</span><span class="t2">${fmt(x.end - x.start)}</span></button>`).join('')}</div>` : ''}
       ${seek}
-      <div class="controls book">
+      <div class="controls book" style="gap:12px">
+        ${list.length > 1 ? `<button class="ctl sm" data-act="prev-ch" aria-label="Previous chapter">${I('prev', 24)}</button>` : ''}
         <button class="ctl" style="width:60px;height:60px" data-act="back15" aria-label="Back 15 seconds">${I('back15', 40, 1.6)}</button>
         <button class="playbig" data-act="toggle" id="bigPlay" aria-label="${audio.paused ? 'Play' : 'Pause'}">${I(audio.paused ? 'play' : 'pause', 34)}</button>
         <button class="ctl" style="width:60px;height:60px" data-act="fwd30" aria-label="Forward 30 seconds">${I('fwd30', 40, 1.6)}</button>
+        ${list.length > 1 ? `<button class="ctl sm" data-act="next-ch" aria-label="Next chapter">${I('next', 24)}</button>` : ''}
       </div>
       <div class="speedlbl">Speed</div>
       <div class="speeds">${SPEEDS.map((v) => `<button class="${p.speed === v ? 'on' : ''}" data-act="speed" data-v="${v}" aria-pressed="${p.speed === v}">${v}×</button>`).join('')}</div>
@@ -701,29 +926,160 @@ function renderPlayer() {
     </div>`;
   }
   const seekEl = $('#seek');
-  seekEl.addEventListener('input', () => { seeking = true; const d = audio.duration || 0; $('#tCur').textContent = fmt((seekEl.value / 1000) * d); });
-  seekEl.addEventListener('change', () => { const d = audio.duration || 0; if (d) audio.currentTime = (seekEl.value / 1000) * d; seeking = false; });
+  seekEl.addEventListener('input', () => { seeking = true; const r = seekRange(); $('#tCur').textContent = fmt((seekEl.value / 1000) * r.len); });
+  seekEl.addEventListener('change', () => { const r = seekRange(); if (r.len) audio.currentTime = r.start + (seekEl.value / 1000) * r.len; seeking = false; });
   updateTimes();
 }
 let seeking = false;
+// The seek bar covers the current chapter for books, the whole song for music.
+function seekRange() {
+  const d = audio.duration || 0, b = curBook();
+  if (b) {
+    const e = toc(b)[entryIndex(b)];
+    const end = e.end > e.start ? e.end : d;
+    return { start: e.start, len: Math.max(0, end - e.start) };
+  }
+  return { start: 0, len: d };
+}
 function updateTimes() {
   if (!S.playerOpen || seeking) return;
-  const d = audio.duration || 0, c = audio.currentTime || 0;
   const seekEl = $('#seek');
   if (!seekEl) return;
-  seekEl.value = d ? Math.round((c / d) * 1000) : 0;
+  const r = seekRange(), c = Math.max(0, (audio.currentTime || 0) - r.start);
+  seekEl.value = r.len ? Math.round(Math.min(1, c / r.len) * 1000) : 0;
   $('#tCur').textContent = fmt(c);
-  $('#tLeft').textContent = '-' + fmt(d - c);
+  $('#tLeft').textContent = '-' + fmt(r.len - c);
   const b = curBook(), tb = $('#tBook');
   if (b && tb) {
-    const done = sum(b.parts.slice(0, prog(b.id).part).map((x) => x.duration || 0)) + c;
-    const r = prog(b.id).speed || 1;
-    tb.textContent = `${fmtLeft((bookTotal(b) - done) / r)} left in book${r !== 1 ? ` at ${r}×` : ''}`;
+    const done = sum(b.parts.slice(0, prog(b.id).part).map((x) => x.duration || 0)) + (audio.currentTime || 0);
+    const rt = prog(b.id).speed || 1;
+    tb.textContent = `${fmtLeft((bookTotal(b) - done) / rt)} left in book${rt !== 1 ? ` at ${rt}×` : ''}`;
   }
 }
 function renderPlayerButtons() {
   const big = $('#bigPlay');
   if (big) { big.innerHTML = I(audio.paused ? 'play' : 'pause', 34); big.setAttribute('aria-label', audio.paused ? 'Play' : 'Pause'); }
+}
+
+/* ============================== playlists ============================== */
+const playlist = (id) => S.playlists.find((p) => p.id === id);
+function groupTitle() {
+  if (!S.group) return 'Your music';
+  if (S.group.type === 'playlist') { const pl = playlist(S.group.name); return pl ? pl.name : 'Playlist'; }
+  return S.group.name;
+}
+function askName(title, value) {
+  const name = window.prompt(title, value || '');
+  return name == null ? null : name.trim();
+}
+async function newPlaylist(fromPicker) {
+  const name = askName('Name of the new playlist:', '');
+  if (!name) return;
+  const pl = { id: uid(), name, songIds: [], created: Date.now() };
+  S.playlists.push(pl);
+  await dbPut('playlists', pl);
+  if (fromPicker && K && K.songId) { addToPlaylist(pl.id); return; }
+  S.musicView = 'playlists';
+  S.group = { type: 'playlist', name: pl.id };
+  renderView();
+  toast(`Playlist “${name}” created`);
+}
+async function renamePlaylist() {
+  const pl = S.group && playlist(S.group.name);
+  if (!pl) return;
+  const name = askName('New name:', pl.name);
+  if (!name) return;
+  pl.name = name;
+  await dbPut('playlists', pl);
+  renderAll();
+}
+async function deletePlaylist() {
+  const pl = S.group && playlist(S.group.name);
+  if (!pl || !confirm(`Delete the playlist “${pl.name}”? The songs stay in your library.`)) return;
+  S.playlists = S.playlists.filter((x) => x.id !== pl.id);
+  await dbDel('playlists', pl.id);
+  S.group = null;
+  renderView();
+  toast('Playlist deleted');
+}
+async function removeFromPlaylist(i) {
+  const pl = S.group && playlist(S.group.name);
+  if (!pl) return;
+  const id = S.visible[i];
+  const at = pl.songIds.indexOf(id);
+  if (at < 0) return;
+  pl.songIds.splice(at, 1);
+  await dbPut('playlists', pl);
+  renderView();
+}
+
+/* picker sheet: "add this song to which playlist?" or "choose songs for this playlist" */
+let K = null;
+function openPlaylistPicker(songId) { K = { mode: 'playlists', songId }; renderPicker(); }
+function openChooser() {
+  const pl = S.group && playlist(S.group.name);
+  if (!pl) return;
+  K = { mode: 'songs', plId: pl.id, sel: new Set(pl.songIds), order: pl.songIds.slice() };
+  renderPicker();
+}
+function closePicker() { K = null; renderPicker(); }
+async function addToPlaylist(plId) {
+  const pl = playlist(plId);
+  if (!pl || !K) return;
+  if (pl.songIds.includes(K.songId)) { toast(`Already in “${pl.name}”`); closePicker(); return; }
+  pl.songIds.push(K.songId);
+  await dbPut('playlists', pl);
+  closePicker();
+  renderView();
+  toast(`Added to “${pl.name}”`);
+}
+function toggleChosen(id) {
+  if (!K) return;
+  if (K.sel.has(id)) K.sel.delete(id); else K.sel.add(id);
+  const row = document.querySelector(`#picker [data-id="${id}"]`);
+  if (row) { row.setAttribute('aria-pressed', K.sel.has(id)); row.querySelector('.tick').innerHTML = K.sel.has(id) ? I('check', 20, 2.6) : ''; }
+  const n = $('#pkCount'); if (n) n.textContent = `${K.sel.size} selected`;
+}
+async function saveChooser() {
+  const pl = K && playlist(K.plId);
+  if (!pl) return closePicker();
+  // keep the existing order, add newly ticked songs at the end
+  const kept = K.order.filter((id) => K.sel.has(id));
+  const added = S.songs.slice().sort((a, b) => byText(a.title, b.title)).map((s) => s.id).filter((id) => K.sel.has(id) && !kept.includes(id));
+  pl.songIds = kept.concat(added);
+  await dbPut('playlists', pl);
+  closePicker();
+  renderView();
+}
+function renderPicker() {
+  const el = $('#picker');
+  if (!K) { el.hidden = true; el.innerHTML = ''; return; }
+  el.hidden = false;
+  if (K.mode === 'playlists') {
+    const s = song(K.songId);
+    el.innerHTML = `<div class="inner">
+      <div class="topbar"><button class="textbtn" data-act="pk-close">Cancel</button><div class="ttl">Add to playlist</div><span style="width:60px"></span></div>
+      <p class="note" style="margin-top:4px">${esc(s ? s.title : '')}</p>
+      <button class="addbtn hot" style="margin:8px 0 6px;width:100%" data-act="pk-new">${I('plus', 24, 2.4)}<span><b>New playlist…</b></span></button>
+      ${S.playlists.slice().sort((x, y) => byText(x.name, y.name)).map((pl) => `
+        <div class="row" style="padding:0"><button class="hit" data-act="pk-pick" data-id="${pl.id}">
+          ${art(pl.songIds.map(song).find((x) => x && x.cover) || { id: pl.id }, 48, 'song')}
+          <span class="txt"><span class="t1">${esc(pl.name)}</span><span class="t2">${pl.songIds.length} song${pl.songIds.length === 1 ? '' : 's'}${pl.songIds.includes(K.songId) ? ' · already added' : ''}</span></span>
+        </button></div>`).join('')}
+    </div>`;
+  } else {
+    const pl = playlist(K.plId);
+    const songs = S.songs.slice().sort((a, b) => byText(a.title, b.title));
+    el.innerHTML = `<div class="inner">
+      <div class="topbar"><button class="textbtn" data-act="pk-close">Cancel</button><div class="ttl">${esc(pl ? pl.name : '')}<small id="pkCount">${K.sel.size} selected</small></div><button class="textbtn b" data-act="pk-done">Done</button></div>
+      ${songs.length ? songs.map((s) => `
+        <div class="row" style="padding:0"><button class="hit" data-act="pk-toggle" data-id="${s.id}" aria-pressed="${K.sel.has(s.id)}">
+          ${art(s, 44, 'song')}
+          <span class="txt"><span class="t1">${esc(s.title)}</span><span class="t2">${esc(s.artist || 'Unknown artist')}</span></span>
+          <span class="tick" style="width:28px;color:var(--accent);display:flex;justify-content:center">${K.sel.has(s.id) ? I('check', 20, 2.6) : ''}</span>
+        </button></div>`).join('') : '<div class="empty">Add some music first.</div>'}
+    </div>`;
+  }
 }
 
 /* ============================== tag editor ============================== */
@@ -758,7 +1114,8 @@ function renderEditor() {
       : kind === 'song' ? 'Changes are saved in Muzik. (Writing tags into the file itself works for MP3 files only.)'
       : 'Changes are saved in Muzik.'}</p>
     <div class="edfoot">
-      ${kind === 'song' ? `<button class="ghost" data-act="ed-export">${I('share', 18)}Save file to Files…</button>` : ''}
+      ${kind === 'song' ? `<button class="ghost" data-act="add-to-pl" data-id="${it.id}">${I('listPlus', 18)}Add to playlist…</button>
+      <button class="ghost" data-act="ed-export">${I('share', 18)}Save file to Files…</button>` : ''}
       <button class="ghost danger" data-act="ed-delete">${I('trash', 18)}Delete from Muzik</button>
     </div>
   </div>`;
@@ -830,6 +1187,9 @@ async function deleteItem() {
   if (kind === 'song') {
     await dbDel('songs', it.id);
     S.songs = S.songs.filter((s) => s.id !== it.id);
+    for (const pl of S.playlists) {
+      if (pl.songIds.includes(it.id)) { pl.songIds = pl.songIds.filter((x) => x !== it.id); dbPut('playlists', pl).catch(() => {}); }
+    }
     S.queue = S.queue.filter((x) => x !== it.id); S.orig = S.orig.filter((x) => x !== it.id);
   } else {
     await dbDel('books', it.id); await dbDel('progress', it.id).catch(() => {});
@@ -876,7 +1236,9 @@ document.addEventListener('click', (ev) => {
     case 'speed': setSpeed(parseFloat(d.v)); break;
     case 'sleep': cycleSleep(); break;
     case 'parts': S.showParts = !S.showParts; renderPlayer(); break;
-    case 'part': loadPart(+d.i, 0, true); break;
+    case 'part': jumpEntry(+d.i); break;
+    case 'prev-ch': prevEntry(); break;
+    case 'next-ch': nextEntry(); break;
     case 'edit': openEditor(d.kind, d.id); break;
     case 'ed-cancel': closeEditor(); break;
     case 'ed-save': saveEditor(); break;
@@ -884,6 +1246,17 @@ document.addEventListener('click', (ev) => {
     case 'ed-cover-remove': if (E) { E.cover = null; E.coverChanged = true; keepFields(renderEditor); } break;
     case 'ed-export': exportSong(); break;
     case 'ed-delete': deleteItem(); break;
+    case 'pl-new': newPlaylist(); break;
+    case 'pl-rename': renamePlaylist(); break;
+    case 'pl-delete': deletePlaylist(); break;
+    case 'pl-remove': removeFromPlaylist(+d.i); break;
+    case 'pl-choose': openChooser(); break;
+    case 'add-to-pl': openPlaylistPicker(d.id); break;
+    case 'pk-pick': addToPlaylist(d.id); break;
+    case 'pk-new': newPlaylist(true); break;
+    case 'pk-toggle': toggleChosen(d.id); break;
+    case 'pk-done': saveChooser(); break;
+    case 'pk-close': closePicker(); break;
   }
 });
 // keep what was typed in the editor when it re-renders (e.g. after choosing a picture)
@@ -911,8 +1284,8 @@ $('#pickCover').addEventListener('change', async (e) => {
   renderTabs();
   try {
     db = await openDB();
-    const [songs, books, progress] = await Promise.all([dbAll('songs'), dbAll('books'), dbAll('progress')]);
-    S.songs = songs; S.books = books;
+    const [songs, books, progress, playlists] = await Promise.all([dbAll('songs'), dbAll('books'), dbAll('progress'), dbAll('playlists')]);
+    S.songs = songs; S.books = books; S.playlists = playlists;
     progress.forEach((p) => { S.progress[p.id] = p; });
   } catch (e) {
     console.error(e);

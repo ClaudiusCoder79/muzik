@@ -3,8 +3,8 @@
 A free music and audiobook player for iPhone that plays your own files. Muzik is a web app (PWA): you install it from Safari, so you don't need a Mac or an Apple Developer account.
 
 ## Features
-- **Music:** songs, albums and artists, search, play all, shuffle, repeat
-- **Audiobooks:** remembers where you stopped in every book, speed from 0.75× to 3×, skip back 15s and forward 30s, a sleep timer, and books made of many MP3 parts
+- **Music:** songs, playlists, albums and artists, search, play all, shuffle, repeat
+- **Audiobooks:** remembers where you stopped in every book, speed from 0.75× to 3×, skip back 15s and forward 30s, a sleep timer, chapters inside M4B files, and books made of many MP3 parts
 - **Edit tags:** title, artist, album, genre, year, track number and your own album art. For MP3 files the tags are written into the file too.
 - Lock screen, headphone and car controls
 - Works offline once it's installed
@@ -23,7 +23,7 @@ A free music and audiobook player for iPhone that plays your own files. Muzik is
 Add your files from the home screen app, not from the Safari tab. Each one keeps its own library.
 
 ## Updating the app later
-Upload the changed files to GitHub. Then, in `sw.js`, change `muzik-v1` to `muzik-v2` (v3 the next time, and so on) so phones download the new version. Close and reopen Muzik twice to pick up the update.
+Upload the changed files to GitHub. Then, in `sw.js`, raise the number in `muzik-v2` (v3 the next time, and so on) so phones download the new version. Close and reopen Muzik twice to pick up the update.
 
 ## Good to know
 - Your music is stored inside Muzik on the phone. If you delete the Muzik icon from the home screen, its library is deleted too.

@@ -1,6 +1,6 @@
 // Muzik service worker: keeps the app working offline.
 // When you change any app file, bump the version number below so phones get the update.
-const CACHE = 'muzik-v1';
+const CACHE = 'muzik-v2';
 const FILES = [
   './',
   'index.html',
